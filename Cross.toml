@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Configuration for `cross` (https://github.com/cross-rs/cross)
+# Installs target-architecture ALSA development headers (`libasound2-dev`)
+# inside the cross container for GNU Linux & Raspberry Pi targets.
+
+[target.i686-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH",
+]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH",
+]
+
+[target.arm-unknown-linux-gnueabihf]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH",
+]
+
+[target.riscv64gc-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH",
+]

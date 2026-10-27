@@ -117,20 +117,33 @@ cargo run --release -- --seed KORES7 --stdout-pcm | ffmpeg -f f32le -ar 48000 -a
 
 ---
 
-## 5. Project Structure
+## 5. Project Structure & Supported Targets
 
 ```text
 BRYUM/
-├── Cargo.toml       # Strictly 3 dependencies: ratatui, crossterm, cpal (GPL-3.0-or-later)
-├── LICENSE          # Full GNU General Public License v3.0 text
-├── README.md        # Project documentation and philosophy
+├── .github/workflows/rust.yml # 16-target CI & Release binary matrix (macOS, Linux, BSD, Windows, ARM/Pi)
+├── Cargo.toml                 # Strictly 3 dependencies: ratatui, crossterm, cpal (GPL-3.0-or-later)
+├── Cross.toml                 # Multiarch ALSA cross-compilation config for cross-rs
+├── LICENSE                    # Full GNU General Public License v3.0 text
+├── README.md                  # Project documentation and philosophy
 └── src/
-    ├── main.rs      # CLI parser (--seed, --stdout-pcm, --version), terminal lifecycle & 60 FPS loop
-    ├── dsp.rs       # Zero-dependency, zero-allocation procedural DSP engine & SPSC atomic bridge
-    ├── garden.rs    # Zero-dependency 2D ecological simulation, wind waves, ripples & pitch quantizer
-    ├── ui.rs        # ratatui Braille Canvas renderer, TrueColor seasonal palettes & mouse/key controller
-    └── audio.rs     # Native cpal real-time stream + headless --stdout-pcm Unix pipe generator
+    ├── main.rs                # CLI parser (--seed, --stdout-pcm, --version), terminal lifecycle & 60 FPS loop
+    ├── dsp.rs                 # Zero-dependency, zero-allocation procedural DSP engine & SPSC atomic bridge
+    ├── garden.rs              # Zero-dependency 2D ecological simulation, wind waves, ripples & pitch quantizer
+    ├── ui.rs                  # ratatui Braille Canvas renderer, TrueColor seasonal palettes & mouse/key controller
+    └── audio.rs               # Native cpal stream + OpenBSD/musl native audio pipe fallback + --stdout-pcm
 ```
+
+### Pre-Built Release Matrix (`.github/workflows/rust.yml`)
+
+| Platform Family | Target Triple(s) | Notes |
+| :--- | :--- | :--- |
+| **macOS** | `x86_64-apple-darwin`, `aarch64-apple-darwin` | Intel & Apple Silicon (M1–M4), CoreAudio via `cpal` |
+| **Windows** | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` | x64 & Windows on ARM64, WASAPI via `cpal` |
+| **Linux (`glibc`)** | `x86_64-unknown-linux-gnu`, `i686-unknown-linux-gnu` | Ubuntu, Debian, Fedora, Arch, RHEL, openSUSE (ALSA via `cpal`) |
+| **Linux (`musl` Static)** | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | Zero-dependency static ELF binaries for *any* Linux distro (Alpine, Void, NixOS, etc.) |
+| **Raspberry Pi & SBCs** | `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `armv7-unknown-linux-musleabihf`, `arm-unknown-linux-gnueabihf`, `arm-unknown-linux-musleabihf`, `riscv64gc-unknown-linux-gnu` | Covers Raspberry Pi 1/Zero (ARMv6), Pi 2/3/4 32-bit (ARMv7), Pi 3/4/5 64-bit (ARM64), and 64-bit RISC-V boards |
+| **FreeBSD & OpenBSD** | `x86_64-unknown-freebsd`, `x86_64-unknown-openbsd` | Native & cross-compiled BSD releases with `sndio` (`aucat`) / PulseAudio / ALSA pipe support |
 
 ---
 

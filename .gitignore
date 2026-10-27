@@ -1,3 +1,5 @@
 /target
+/dist
+/artifacts
 .DS_Store
 *.swp

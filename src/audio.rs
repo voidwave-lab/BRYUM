@@ -18,24 +18,31 @@
 
 //! Audio Output Backend (`audio.rs`)
 //!
-//! Provides two output paths over the pure procedural `DspEngine`:
-//! 1. Cross-platform real-time audio via `cpal` (zero allocations on callback thread).
-//! 2. Future-proof Unix pipe mode (`--stdout-pcm`) writing raw interleaved stereo `f32le`
+//! Provides three output layers over the pure procedural `DspEngine`:
+//! 1. Cross-platform real-time audio via `cpal` (CoreAudio on macOS, WASAPI on Windows,
+//!    ALSA on Linux/FreeBSD — zero allocations on callback thread).
+//! 2. Automatic native pipe fallback for OpenBSD (`aucat` / `sndio`), static `musl` Linux
+//!    (`pw-cat` / `pacat` / `aplay`), or FreeBSD/headless environments.
+//! 3. Explicit Unix pipe mode (`--stdout-pcm`) writing raw interleaved stereo `f32le`
 //!    PCM frames directly to `stdout`.
 
 use std::io::{self, Write};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cpal")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(feature = "cpal")]
 use cpal::{SampleFormat, Stream};
 
 use crate::dsp::{DspEngine, SharedAudioBridge};
 
 /// Holds the active audio output stream or background fallback worker.
 pub struct AudioHandle {
+    #[cfg(feature = "cpal")]
     _stream: Option<Stream>,
     running: Arc<AtomicBool>,
 }
@@ -46,12 +53,15 @@ impl Drop for AudioHandle {
     }
 }
 
-/// Start the native `cpal` real-time audio stream.
-/// If the system has no available audio device (e.g. headless SSH), falls back to a
-/// silent background DSP consumer so the visual waveform and lock-free queue still flow.
+/// Start the real-time audio backend.
+/// Tries native `cpal` first (when compiled with the default `cpal` feature);
+/// if unavailable (e.g. OpenBSD `sndio`, static `musl` builds, or headless SSH),
+/// automatically tries a native system audio pipe (`aucat`, `pacat`, `aplay`) or
+/// runs a silent timing loop so the visual waveform and lock-free queue still flow.
 pub fn start_cpal_audio(bridge: Arc<SharedAudioBridge>, seed: u64) -> AudioHandle {
     let running = Arc::new(AtomicBool::new(true));
 
+    #[cfg(feature = "cpal")]
     if let Some(stream) = try_init_cpal(Arc::clone(&bridge), seed) {
         return AudioHandle {
             _stream: Some(stream),
@@ -59,27 +69,88 @@ pub fn start_cpal_audio(bridge: Arc<SharedAudioBridge>, seed: u64) -> AudioHandl
         };
     }
 
-    // Headless fallback thread so waveform & queue continue functioning without audio hardware
     let run_flag = Arc::clone(&running);
     thread::spawn(move || {
         let mut engine = Box::new(DspEngine::new(48_000.0, seed));
+        let mut child_pipe = try_spawn_system_audio_pipe();
         let block_frames = 512usize;
         let sleep_dur = Duration::from_micros((block_frames as u64 * 1_000_000) / 48_000);
+        let mut pcm_s16_buf = [0u8; 512 * 4];
+        let mut next_tick = Instant::now();
+
         while run_flag.load(Ordering::Relaxed) {
             engine.poll_commands(&bridge);
-            for _ in 0..block_frames {
-                let _ = engine.next_stereo_frame(&bridge);
+            for i in 0..block_frames {
+                let (l, r) = engine.next_stereo_frame(&bridge);
+                let li = (l.clamp(-1.0, 1.0) * 32767.0) as i16;
+                let ri = (r.clamp(-1.0, 1.0) * 32767.0) as i16;
+                let off = i * 4;
+                pcm_s16_buf[off..off + 2].copy_from_slice(&li.to_le_bytes());
+                pcm_s16_buf[off + 2..off + 4].copy_from_slice(&ri.to_le_bytes());
             }
-            thread::sleep(sleep_dur);
+
+            if let Some(ref mut child) = child_pipe {
+                let write_ok = child
+                    .stdin
+                    .as_mut()
+                    .map(|stdin| stdin.write_all(&pcm_s16_buf).is_ok())
+                    .unwrap_or(false);
+                if !write_ok {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    child_pipe = None;
+                }
+            }
+
+            next_tick += sleep_dur;
+            let now = Instant::now();
+            if next_tick > now {
+                thread::sleep(next_tick - now);
+            } else {
+                next_tick = now;
+            }
+        }
+
+        if let Some(mut child) = child_pipe {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     });
 
     AudioHandle {
+        #[cfg(feature = "cpal")]
         _stream: None,
         running,
     }
 }
 
+/// Attempt to spawn a zero-configuration system audio player accepting raw 48kHz stereo `s16le` PCM on `stdin`.
+/// Covers OpenBSD (`aucat`), PulseAudio/PipeWire (`pacat`), and ALSA (`aplay`).
+fn try_spawn_system_audio_pipe() -> Option<Child> {
+    let candidates: &[(&str, &[&str])] = &[
+        // OpenBSD native sndio tool
+        ("aucat", &["-f", "default", "-e", "s16le", "-r", "48000", "-c", "0:1", "-i", "-"]),
+        // PulseAudio / PipeWire-Pulse stream player
+        ("pacat", &["--playback", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=40"]),
+        // ALSA native player (useful on static musl Linux & Raspberry Pi)
+        ("aplay", &["-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-"]),
+    ];
+
+    for &(bin, args) in candidates {
+        if let Ok(child) = Command::new(bin)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            return Some(child);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "cpal")]
 fn try_init_cpal(bridge: Arc<SharedAudioBridge>, seed: u64) -> Option<Stream> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;

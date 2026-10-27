@@ -1,22 +1,299 @@
-name: Rust
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# BRYUM — Multi-Platform CI & Release Matrix Workflow
+# Builds and packages release binaries for:
+#   - macOS (x86_64 Intel & aarch64 Apple Silicon)
+#   - Windows (x86_64 & aarch64 ARM64)
+#   - Linux glibc (x86_64, i686, aarch64, armv7hf, armv6hf, riscv64gc)
+#   - Linux musl static (x86_64, aarch64, armv7hf, armv6hf — portable across all distros)
+#   - Raspberry Pi & SBCs (Pi 1/Zero ARMv6, Pi 2/3/4 ARMv7, Pi 3/4/5 ARM64, RISC-V)
+#   - FreeBSD (x86_64)
+#   - OpenBSD (x86_64)
+
+name: CI & Release Binaries
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master", "main"]
+    tags: ["v*"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master", "main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # ---------------------------------------------------------------------------
+  # 1. Core Test Suite (Linux, macOS, Windows)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    runs-on: ubuntu-latest
+      - name: Install ALSA development headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run test suite (default features with cpal)
+        run: cargo test --verbose
+
+      - name: Run test suite (pure-Rust pipe/stdout backend without cpal)
+        run: cargo test --no-default-features --verbose
+
+  # ---------------------------------------------------------------------------
+  # 2. Release Binary Matrix (macOS, Windows, Linux glibc/musl, Raspberry Pi, FreeBSD)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.label }} — ${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- macOS (Intel & Apple Silicon) ---
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            features: ""
+            archive: tar.gz
+            label: "macOS Intel"
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            features: ""
+            archive: tar.gz
+            label: "macOS Apple Silicon"
+
+          # --- Windows (x86_64 & ARM64) ---
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            features: ""
+            archive: zip
+            label: "Windows x86_64"
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            features: ""
+            archive: zip
+            label: "Windows ARM64"
+
+          # --- Linux Standard glibc (Ubuntu, Debian, Fedora, Arch, RHEL, openSUSE) ---
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            features: ""
+            archive: tar.gz
+            label: "Linux x86_64 (glibc + ALSA)"
+
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            features: ""
+            archive: tar.gz
+            label: "Linux i686 32-bit (glibc + ALSA)"
+
+          # --- Linux Universal Static musl (Alpine, Void, NixOS, Gentoo, Any Distro) ---
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            features: "--no-default-features"
+            archive: tar.gz
+            label: "Linux x86_64 (Static musl — All Distros)"
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            features: "--no-default-features"
+            archive: tar.gz
+            label: "Linux ARM64 / Raspberry Pi 4 & 5 (Static musl)"
+
+          # --- ARM, Raspberry Pi & Single-Board Computers (glibc + ALSA & static musl) ---
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            features: ""
+            archive: tar.gz
+            label: "Raspberry Pi 3/4/5 & ARM64 SBC (glibc + ALSA)"
+
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            use_cross: true
+            features: ""
+            archive: tar.gz
+            label: "Raspberry Pi 2/3/4 32-bit ARMv7 (glibc + ALSA)"
+
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            use_cross: true
+            features: "--no-default-features"
+            archive: tar.gz
+            label: "Raspberry Pi 2/3/4 32-bit ARMv7 (Static musl)"
+
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            use_cross: true
+            features: ""
+            archive: tar.gz
+            label: "Raspberry Pi 1 / Zero / Zero W ARMv6 (glibc + ALSA)"
+
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-latest
+            use_cross: true
+            features: "--no-default-features"
+            archive: tar.gz
+            label: "Raspberry Pi 1 / Zero / Zero W ARMv6 (Static musl)"
+
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            features: ""
+            archive: tar.gz
+            label: "RISC-V 64-bit Linux SBC (glibc + ALSA)"
+
+          # --- FreeBSD ---
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            use_cross: true
+            features: "--no-default-features"
+            archive: tar.gz
+            label: "FreeBSD x86_64"
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install host ALSA headers (native Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - name: Install cross-rs
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary (Cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+
+      - name: Build release binary (Cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} ${{ matrix.features }}
+
+      - name: Package Unix release archive (.tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE_DIR="bryum-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE_DIR}"
+          cp "target/${{ matrix.target }}/release/bryum" "dist/${STAGE_DIR}/"
+          cp LICENSE README.md "dist/${STAGE_DIR}/"
+          tar -C dist -czf "dist/${STAGE_DIR}.tar.gz" "${STAGE_DIR}"
+
+      - name: Package Windows release archive (.zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $StageDir = "bryum-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$StageDir" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bryum.exe" "dist/$StageDir/"
+          Copy-Item "LICENSE", "README.md" "dist/$StageDir/"
+          Compress-Archive -Path "dist/$StageDir" -DestinationPath "dist/$StageDir.zip"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bryum-${{ matrix.target }}
+          path: |
+            dist/bryum-${{ matrix.target }}.tar.gz
+            dist/bryum-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. OpenBSD Native Build (x86_64-unknown-openbsd via OpenBSD VM)
+  # ---------------------------------------------------------------------------
+  build-openbsd:
+    name: Build (OpenBSD x86_64 — x86_64-unknown-openbsd)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build inside OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg_add rust
+          run: |
+            cargo build --release --no-default-features
+            STAGE_DIR="bryum-x86_64-unknown-openbsd"
+            mkdir -p "dist/${STAGE_DIR}"
+            cp "target/release/bryum" "dist/${STAGE_DIR}/"
+            cp LICENSE README.md "dist/${STAGE_DIR}/"
+            tar -C dist -czf "dist/${STAGE_DIR}.tar.gz" "${STAGE_DIR}"
+
+      - name: Upload OpenBSD binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bryum-x86_64-unknown-openbsd
+          path: dist/bryum-x86_64-unknown-openbsd.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish GitHub Release & SHA-256 Checksums (on version tags `v*`)
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [build, build-openbsd]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: artifacts
+        run: |
+          sha256sum bryum-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/bryum-*
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true
