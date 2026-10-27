@@ -152,9 +152,9 @@ jobs:
           - target: arm-unknown-linux-gnueabihf
             os: ubuntu-latest
             use_cross: true
-            features: ""
+            features: "--no-default-features"
             archive: tar.gz
-            label: "Raspberry Pi 1 / Zero / Zero W ARMv6 (glibc + ALSA)"
+            label: "Raspberry Pi 1 / Zero / Zero W ARMv6 (glibc)"
 
           - target: arm-unknown-linux-musleabihf
             os: ubuntu-latest
@@ -166,9 +166,9 @@ jobs:
           - target: riscv64gc-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
-            features: ""
+            features: "--no-default-features"
             archive: tar.gz
-            label: "RISC-V 64-bit Linux SBC (glibc + ALSA)"
+            label: "RISC-V 64-bit Linux SBC (glibc)"
 
           # --- FreeBSD ---
           - target: x86_64-unknown-freebsd
