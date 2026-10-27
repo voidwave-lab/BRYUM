@@ -1,7 +1,7 @@
 # ✿ BRYUM — Generative Sound Garden in the Terminal
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-![Rust Edition](https://img.shields.io/badge/Rust-2021-orange.svg)
+![Rust Edition](https://img.shields.io/badge/Rust-2021-orange.svg) [![CI & Release Binaries](https://github.com/voidwave-lab/BRYUM/actions/workflows/rust.yml/badge.svg)](https://github.com/voidwave-lab/BRYUM/actions/workflows/rust.yml)
 
 **BRYUM** (named after the resilient genus of mosses) is a hypnotic, terminal-based (TUI) generative ambient sound garden written in Rust. Designed from the ground up for non-musicians, it replaces technical synthesizer panels with a living visual terrarium where you plant **Stones**, **Leaves**, **Streams**, and **Stars** brushed by slow-drifting wind currents.
 
