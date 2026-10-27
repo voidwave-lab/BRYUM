@@ -168,6 +168,8 @@ fn main() -> io::Result<()> {
         Ok(())
     })();
 
+    ui_state.finalize_recording_if_active(&bridge);
+
     // Restore terminal state
     let _ = disable_raw_mode();
     let _ = execute!(

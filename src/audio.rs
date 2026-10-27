@@ -26,12 +26,14 @@
 //! 3. Explicit Unix pipe mode (`--stdout-pcm`) writing raw interleaved stereo `f32le`
 //!    PCM frames directly to `stdout`.
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "cpal")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -70,6 +72,7 @@ pub fn start_cpal_audio(bridge: Arc<SharedAudioBridge>, seed: u64) -> AudioHandl
     }
 
     let run_flag = Arc::clone(&running);
+    bridge.set_sample_rate(48_000);
     thread::spawn(move || {
         let mut engine = Box::new(DspEngine::new(48_000.0, seed));
         let mut child_pipe = try_spawn_system_audio_pipe();
@@ -159,6 +162,7 @@ fn try_init_cpal(bridge: Arc<SharedAudioBridge>, seed: u64) -> Option<Stream> {
     let config: cpal::StreamConfig = supported_config.into();
     let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
+    bridge.set_sample_rate(config.sample_rate.0);
 
     // Pre-allocate the DSP engine on the heap before entering the real-time thread
     let mut engine = Box::new(DspEngine::new(sample_rate, seed));
@@ -292,3 +296,188 @@ pub fn run_stdout_pcm_stream(seed_code: String, seed: u64) -> io::Result<()> {
         }
     }
 }
+
+/// Pure-Rust stereo 16-bit PCM WAV session recorder writing to the user's `$HOME` directory.
+/// Drains captured stereo frames from `SharedAudioBridge` on the UI thread without blocking
+/// the real-time audio callback.
+pub struct WavRecorder {
+    writer: BufWriter<File>,
+    pub file_path: PathBuf,
+    pub display_name: String,
+    sample_rate: u32,
+    frames_written: u64,
+    finalized: bool,
+}
+
+impl WavRecorder {
+    /// Create a new WAV file in `$HOME` (or `USERPROFILE` on Windows, falling back to `.`)
+    /// named `bryum_<SEED>_<UNIX_TIMESTAMP>.wav` and write the initial 44-byte RIFF header.
+    pub fn start_in_home(seed_code: &str, bridge: &SharedAudioBridge) -> io::Result<Self> {
+        let home_dir = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let filename = format!("bryum_{}_{}.wav", seed_code, ts);
+        let file_path = home_dir.join(&filename);
+        let display_name = format!("~/{}", filename);
+
+        let sample_rate = bridge.sample_rate().max(8000);
+        let file = File::create(&file_path)?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+
+        // Drain any stale frames before starting
+        while bridge.pop_recorded_frame().is_some() {}
+
+        write_wav_header(&mut writer, sample_rate, 0)?;
+        bridge.set_recording(true);
+
+        Ok(Self {
+            writer,
+            file_path,
+            display_name,
+            sample_rate,
+            frames_written: 0,
+            finalized: false,
+        })
+    }
+
+    /// Drain all pending stereo frames from the lock-free audio bridge and write them to disk.
+    pub fn poll_and_write(&mut self, bridge: &SharedAudioBridge) -> io::Result<()> {
+        let mut chunk = [0u8; 1024]; // 256 stereo 16-bit PCM frames (4 bytes per frame)
+        let mut chunk_pos = 0usize;
+
+        while let Some((l, r)) = bridge.pop_recorded_frame() {
+            let li = (l.clamp(-1.0, 1.0) * 32767.0) as i16;
+            let ri = (r.clamp(-1.0, 1.0) * 32767.0) as i16;
+            chunk[chunk_pos..chunk_pos + 2].copy_from_slice(&li.to_le_bytes());
+            chunk[chunk_pos + 2..chunk_pos + 4].copy_from_slice(&ri.to_le_bytes());
+            chunk_pos += 4;
+            self.frames_written += 1;
+
+            if chunk_pos == chunk.len() {
+                self.writer.write_all(&chunk)?;
+                chunk_pos = 0;
+            }
+        }
+
+        if chunk_pos > 0 {
+            self.writer.write_all(&chunk[..chunk_pos])?;
+        }
+
+        Ok(())
+    }
+
+    /// Elapsed recording duration in whole seconds.
+    #[inline]
+    pub fn elapsed_secs(&self) -> u64 {
+        self.frames_written / (self.sample_rate.max(1) as u64)
+    }
+
+    /// Stop capturing, drain remaining frames, patch the RIFF/data chunk lengths, and flush.
+    pub fn stop_and_finalize(&mut self, bridge: &SharedAudioBridge) -> io::Result<String> {
+        bridge.set_recording(false);
+        let _ = self.poll_and_write(bridge);
+        self.patch_wav_sizes()?;
+        self.finalized = true;
+        Ok(self.display_name.clone())
+    }
+
+    fn patch_wav_sizes(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        let data_bytes = (self.frames_written.saturating_mul(4)).min(u32::MAX as u64 - 36) as u32;
+        let riff_size = 36u32.saturating_add(data_bytes);
+
+        let inner = self.writer.get_mut();
+        inner.seek(SeekFrom::Start(4))?;
+        inner.write_all(&riff_size.to_le_bytes())?;
+        inner.seek(SeekFrom::Start(40))?;
+        inner.write_all(&data_bytes.to_le_bytes())?;
+        inner.seek(SeekFrom::End(0))?;
+        inner.sync_all()?;
+        Ok(())
+    }
+}
+
+impl Drop for WavRecorder {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _ = self.patch_wav_sizes();
+        }
+    }
+}
+
+/// Write a standard 44-byte 16-bit stereo RIFF WAVE header.
+fn write_wav_header<W: Write>(w: &mut W, sample_rate: u32, data_bytes: u32) -> io::Result<()> {
+    let channels: u16 = 2;
+    let bits_per_sample: u16 = 16;
+    let block_align: u16 = channels * (bits_per_sample / 8); // 4 bytes
+    let byte_rate: u32 = sample_rate * (block_align as u32);
+    let riff_size: u32 = 36u32.saturating_add(data_bytes);
+
+    w.write_all(b"RIFF")?;
+    w.write_all(&riff_size.to_le_bytes())?;
+    w.write_all(b"WAVE")?;
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk length
+    w.write_all(&1u16.to_le_bytes())?; // WAVE_FORMAT_PCM (1)
+    w.write_all(&channels.to_le_bytes())?;
+    w.write_all(&sample_rate.to_le_bytes())?;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&block_align.to_le_bytes())?;
+    w.write_all(&bits_per_sample.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_bytes.to_le_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn test_wav_recorder_header_and_samples() {
+        let bridge = SharedAudioBridge::new();
+        bridge.set_sample_rate(48_000);
+
+        let tmp_dir = std::env::temp_dir();
+        std::env::set_var("HOME", &tmp_dir);
+
+        let mut rec = WavRecorder::start_in_home("TEST99", &bridge).expect("start wav recorder");
+        let path = rec.file_path.clone();
+
+        for i in 0..1000 {
+            let s = (i as f32 * 0.05).sin() * 0.5;
+            bridge.push_recorded_frame(s, -s);
+        }
+
+        rec.poll_and_write(&bridge).expect("poll and write");
+        rec.stop_and_finalize(&bridge).expect("finalize wav");
+
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .expect("open wav")
+            .read_to_end(&mut bytes)
+            .expect("read wav");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(&bytes[36..40], b"data");
+
+        let data_size = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(data_size, 1000 * 4);
+        assert_eq!(riff_size, 36 + data_size);
+        assert_eq!(bytes.len(), 44 + (data_size as usize));
+    }
+}
+
+

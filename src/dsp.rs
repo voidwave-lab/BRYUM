@@ -23,7 +23,7 @@
 //! and lock-free ringbuffers use fixed-size inline arrays.
 
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Number of drone voices in the pool.
 pub const MAX_DRONES: usize = 4;
@@ -33,6 +33,8 @@ pub const MAX_RESONATORS: usize = 12;
 const KS_BUFFER_LEN: usize = 2048;
 /// Lock-free command ring buffer capacity (must be power of two).
 const CMD_QUEUE_CAP: usize = 256;
+/// Lock-free WAV recording stereo frame ring buffer capacity (must be power of two).
+pub const REC_RING_CAP: usize = 32768;
 /// Number of samples exposed to the UI for the breathing waveform display.
 pub const WAVEFORM_BINS: usize = 64;
 
@@ -771,10 +773,15 @@ pub struct SharedAudioBridge {
     read_idx: AtomicUsize,
     waveform_bins: [AtomicU32; WAVEFORM_BINS],
     waveform_cursor: AtomicUsize,
+    rec_buf: [std::cell::UnsafeCell<(f32, f32)>; REC_RING_CAP],
+    rec_write_idx: AtomicUsize,
+    rec_read_idx: AtomicUsize,
+    recording_active: AtomicBool,
+    sample_rate_hz: AtomicU32,
 }
 
-// Safety: SPSC ring buffer uses Acquire/Release atomic indices for `cmd_buf` access,
-// and `waveform_bins` uses atomic `u32` bit-cast floats.
+// Safety: SPSC ring buffers use Acquire/Release atomic indices for `cmd_buf` and `rec_buf`
+// access, and `waveform_bins` uses atomic `u32` bit-cast floats.
 unsafe impl Sync for SharedAudioBridge {}
 unsafe impl Send for SharedAudioBridge {}
 
@@ -788,7 +795,66 @@ impl SharedAudioBridge {
             read_idx: AtomicUsize::new(0),
             waveform_bins: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             waveform_cursor: AtomicUsize::new(0),
+            rec_buf: std::array::from_fn(|_| std::cell::UnsafeCell::new((0.0, 0.0))),
+            rec_write_idx: AtomicUsize::new(0),
+            rec_read_idx: AtomicUsize::new(0),
+            recording_active: AtomicBool::new(false),
+            sample_rate_hz: AtomicU32::new(48_000),
         }
+    }
+
+    /// Set the active hardware sample rate (called once when the audio engine starts).
+    #[inline]
+    pub fn set_sample_rate(&self, sr: u32) {
+        self.sample_rate_hz.store(sr.max(8000), Ordering::Relaxed);
+    }
+
+    /// Read the active hardware sample rate in Hz.
+    #[inline]
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate_hz.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable lock-free stereo frame capture for WAV recording.
+    #[inline]
+    pub fn set_recording(&self, active: bool) {
+        self.recording_active.store(active, Ordering::Release);
+    }
+
+    /// Check whether WAV recording capture is currently active.
+    #[inline]
+    pub fn is_recording(&self) -> bool {
+        self.recording_active.load(Ordering::Relaxed)
+    }
+
+    /// Push a stereo frame from the real-time audio thread into the lock-free recording ring buffer.
+    #[inline]
+    pub fn push_recorded_frame(&self, left: f32, right: f32) -> bool {
+        let w = self.rec_write_idx.load(Ordering::Relaxed);
+        let r = self.rec_read_idx.load(Ordering::Acquire);
+        let next_w = (w + 1) & (REC_RING_CAP - 1);
+        if next_w == r {
+            return false; // Ring buffer full
+        }
+        unsafe {
+            *self.rec_buf[w].get() = (left, right);
+        }
+        self.rec_write_idx.store(next_w, Ordering::Release);
+        true
+    }
+
+    /// Pop a recorded stereo frame on the UI/writer thread (non-blocking, zero allocation).
+    #[inline]
+    pub fn pop_recorded_frame(&self) -> Option<(f32, f32)> {
+        let r = self.rec_read_idx.load(Ordering::Relaxed);
+        let w = self.rec_write_idx.load(Ordering::Acquire);
+        if r == w {
+            return None;
+        }
+        let frame = unsafe { *self.rec_buf[r].get() };
+        let next_r = (r + 1) & (REC_RING_CAP - 1);
+        self.rec_read_idx.store(next_r, Ordering::Release);
+        Some(frame)
     }
 
     /// Push a command from the UI/simulation thread (non-blocking, zero allocation).
@@ -1008,6 +1074,11 @@ impl DspEngine {
         if self.scope_decimator >= 750 {
             self.scope_decimator = 0;
             bridge.record_waveform_sample(self.scope_accum);
+        }
+
+        // If WAV session recording is active, push the stereo frame into the lock-free capture ring
+        if bridge.is_recording() {
+            bridge.push_recorded_frame(out_l, out_r);
         }
 
         (out_l, out_r)

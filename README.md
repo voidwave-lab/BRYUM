@@ -57,6 +57,7 @@ All synthesis and effects processing is implemented from scratch in `src/dsp.rs`
   - *2-Operator Crystalline FM:* Consonant harmonic modulator ratios (`1.5`, `2.0`, `3.0`, `4.0`) with independent modulator and carrier exponential decay envelopes.
 - **Paul Kellet's 7-State Pink Noise Stream:** White noise shaped through Paul Kellet's refined pink-noise filter (`±0.05 dB` accuracy) and routed into dual stereo wandering bandpass Chamberlain SVFs.
 - **Global Stereo Reverb (4×4 Hadamard FDN):** Stereo input diffusion via cascaded Schroeder allpass filters feeding a 4×4 orthogonal Hadamard Feedback Delay Network with mutually prime delay lines, linear-interpolated LFO modulation, high-frequency damping, and **6 to 15 seconds** of lush ambient decay, finished with a smooth Padé rational soft-clipper.
+- **Lock-Free WAV Session Recorder (`O` Key):** Captures real-time stereo output frames from the DSP thread via a pre-allocated 32,768-frame SPSC ringbuffer (`REC_RING_CAP`) with zero locks or heap allocations on the audio callback. A pure-Rust RIFF WAVE writer (`WavRecorder` in `src/audio.rs`) streams 16-bit stereo PCM directly to `$HOME/bryum_<SEED>_<TIMESTAMP>.wav` and automatically patches the `RIFF` and `data` chunk byte sizes when recording is stopped or the application exits.
 
 ### Three-Tier `ratatui` Braille Interface (`src/ui.rs`)
 
@@ -85,6 +86,11 @@ Start with a specific 6-character deterministic **Garden Seed**:
 cargo run --release -- --seed KORES7
 ```
 
+### Live Session Recording to `$HOME` (`O` Key)
+While inside the interactive TUI, press **`O`** at any time to start recording your live session:
+- A pulsing **`● REC MM:SS (~/bryum_<SEED>_<TIMESTAMP>.wav)`** indicator appears in the top Terrarium title bar.
+- Press **`O`** again (or quit with **`Q`** / **`Esc`** / **`Ctrl+C`**) to finalize and flush the stereo 16-bit PCM `.wav` file in your `$HOME` directory (`USERPROFILE` on Windows), displaying a **`✓ Saved ~/bryum_<SEED>_<TIMESTAMP>.wav`** confirmation banner.
+
 ### Headless Unix Pipe Mode (`--stdout-pcm`)
 Bypass `cpal` and the TUI to stream raw stereo 32-bit floating-point PCM (`f32le`, 48,000 Hz, 2 channels) directly to `stdout`:
 ```sh
@@ -112,6 +118,7 @@ cargo run --release -- --seed KORES7 --stdout-pcm | ffmpeg -f f32le -ar 48000 -a
 | **`Tab` / `Shift+Tab`** | Cycle active Atmosphere macro (**Wind Speed** → **Mist / Depth** → **Abundance**) |
 | **`-` / `+`** (or **`[` / `]`**) | Decrease / increase the selected Atmosphere macro |
 | **`R`** | Generate a new deterministic 6-character **Garden Seed** and repopulate |
+| **`O`** | Start / stop recording the live session to `$HOME/bryum_<SEED>_<TIMESTAMP>.wav` (16-bit stereo WAV) |
 | **`C`** | Clear all elements from the terrarium |
 | **`Q` / `Esc`** | Quit cleanly |
 

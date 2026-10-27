@@ -34,6 +34,7 @@ use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph};
 use ratatui::Frame;
 
+use crate::audio::WavRecorder;
 use crate::dsp::{Season, SharedAudioBridge, WAVEFORM_BINS};
 use crate::garden::{
     ElementKind, Garden, MacroControl, WORLD_HEIGHT, WORLD_WIDTH,
@@ -171,6 +172,8 @@ pub struct UiState {
     pub abundance_gauge_rect: Rect,
     pub waveform_buf: [f32; WAVEFORM_BINS],
     pub smoothed_waveform: [f32; WAVEFORM_BINS],
+    pub recorder: Option<WavRecorder>,
+    pub last_saved_notice: Option<(String, f32)>,
     pub should_quit: bool,
 }
 
@@ -184,11 +187,14 @@ impl UiState {
             abundance_gauge_rect: Rect::default(),
             waveform_buf: [0.0; WAVEFORM_BINS],
             smoothed_waveform: [0.0; WAVEFORM_BINS],
+            recorder: None,
+            last_saved_notice: None,
             should_quit: false,
         }
     }
 
-    /// Smoothly transition the TrueColor palette toward the active Season and update waveform.
+    /// Smoothly transition the TrueColor palette toward the active Season, update waveform,
+    /// and drain any recorded WAV frames to disk.
     pub fn update(&mut self, dt: f32, garden: &Garden, bridge: &SharedAudioBridge) {
         let target = SeasonPalette::for_season(garden.season);
         self.palette = self.palette.lerp(target, (dt * 3.2).clamp(0.0, 1.0));
@@ -197,6 +203,36 @@ impl UiState {
         for i in 0..WAVEFORM_BINS {
             self.smoothed_waveform[i] =
                 self.smoothed_waveform[i] * 0.75 + self.waveform_buf[i] * 0.25;
+        }
+
+        if let Some(ref mut rec) = self.recorder {
+            let _ = rec.poll_and_write(bridge);
+        }
+
+        if let Some((_, ref mut ttl)) = self.last_saved_notice {
+            *ttl -= dt;
+            if *ttl <= 0.0 {
+                self.last_saved_notice = None;
+            }
+        }
+    }
+
+    /// Toggle WAV session recording in `$HOME` on/off.
+    pub fn toggle_recording(&mut self, garden: &Garden, bridge: &SharedAudioBridge) {
+        if let Some(mut rec) = self.recorder.take() {
+            if let Ok(saved_path) = rec.stop_and_finalize(bridge) {
+                self.last_saved_notice = Some((saved_path, 6.0));
+            }
+        } else if let Ok(rec) = WavRecorder::start_in_home(&garden.seed_code, bridge) {
+            self.last_saved_notice = None;
+            self.recorder = Some(rec);
+        }
+    }
+
+    /// Ensure any active WAV recording is cleanly finalized before exiting.
+    pub fn finalize_recording_if_active(&mut self, bridge: &SharedAudioBridge) {
+        if let Some(mut rec) = self.recorder.take() {
+            let _ = rec.stop_and_finalize(bridge);
         }
     }
 
@@ -230,7 +266,7 @@ impl UiState {
     /// Section 1: Main Terrarium View (Top 75%) with `Marker::Braille` Canvas.
     fn render_terrarium(&self, frame: &mut Frame, area: Rect, garden: &Garden) {
         let pal = self.palette;
-        let title = Line::from(vec![
+        let mut title_spans = vec![
             Span::styled(
                 " ✿ BRYUM ",
                 Style::default()
@@ -247,7 +283,30 @@ impl UiState {
                     .fg(pal.color_for_element(garden.selected_tool).to_color())
                     .add_modifier(Modifier::BOLD),
             ),
-        ]);
+        ];
+
+        if let Some(ref rec) = self.recorder {
+            let secs = rec.elapsed_secs();
+            let mins = secs / 60;
+            let rem_secs = secs % 60;
+            let pulse = ((garden.time * 4.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+            let rec_color = RgbF32::new(235, 85, 85)
+                .lerp(RgbF32::new(255, 165, 120), pulse)
+                .to_color();
+            title_spans.push(Span::styled(
+                format!(" ● REC {:02}:{:02} ({}) ", mins, rem_secs, rec.display_name),
+                Style::default().fg(rec_color).add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some((ref path, _)) = self.last_saved_notice {
+            title_spans.push(Span::styled(
+                format!(" ✓ Saved {} ", path),
+                Style::default()
+                    .fg(pal.leaf.to_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        let title = Line::from(title_spans);
 
         let block = Block::default()
             .title(title)
@@ -592,6 +651,17 @@ impl UiState {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("│ ", Style::default().fg(pal.border.to_color())),
+            if self.recorder.is_some() {
+                Span::styled(
+                    "[O]Stop WAV ",
+                    Style::default()
+                        .fg(Color::Rgb(245, 110, 110))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("[O]Record WAV ", Style::default().fg(pal.text_primary.to_color()))
+            },
+            Span::styled("│ ", Style::default().fg(pal.border.to_color())),
             Span::styled("[Q]Quit", Style::default().fg(pal.text_muted.to_color())),
         ]);
 
@@ -616,6 +686,7 @@ impl UiState {
         bridge: &SharedAudioBridge,
     ) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.finalize_recording_if_active(bridge);
             self.should_quit = true;
             return;
         }
@@ -623,6 +694,7 @@ impl UiState {
         let step = 3.2;
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                self.finalize_recording_if_active(bridge);
                 self.should_quit = true;
             }
             // Select Element Type (1..4)
@@ -677,9 +749,12 @@ impl UiState {
                 garden.adjust_selected_macro(0.05, bridge);
             }
 
-            // Re-seed or Clear
+            // Re-seed, Record WAV to $HOME, or Clear
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 garden.randomize_seed(bridge);
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.toggle_recording(garden, bridge);
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 garden.clear_all(bridge);
